@@ -10,6 +10,7 @@ public struct MonitorService {
     private static var allObserversConfigured = false
     private static var appCreateObserver: AXObserver!
     private static var appDestroyObserver: AXObserver!
+    private static var observedDockProcessId: pid_t?
     private static let onElementCreateCallback = ObserverCallbackInfo {
         reloadAppElements()
     }
@@ -30,6 +31,13 @@ public struct MonitorService {
 
     public static func setupObservers() {
         timer = Timer.scheduledTimer(withTimeInterval: checkInterval, repeats: true) { timer in
+            // The Dock restarts after OS updates, sleep/wake or display changes;
+            // our observers and cached elements still point to the dead process.
+            if let observedDockProcessId = observedDockProcessId,
+               observedDockProcessId != currentDockProcessId() {
+                resetDockObservers()
+            }
+
             if appCreateObserver == nil || appDestroyObserver == nil {
                 setupAxObserversOnDock()
             }
@@ -66,13 +74,37 @@ public struct MonitorService {
         }
 
         var statusLabel: AnyObject?
-        AXUIElementCopyAttributeValue(targetAppElement, "AXStatusLabel" as CFString, &statusLabel)
+        let err = AXUIElementCopyAttributeValue(targetAppElement, "AXStatusLabel" as CFString, &statusLabel)
+        if err == .invalidUIElement || err == .cannotComplete {
+            // Cached element is stale (e.g. its Dock process died), look it up again
+            observedAppInfos[appName]?.updateAppElement(tryGetTargetAppElement(appName: appName))
+            return nil
+        }
 
         return statusLabel as? String
     }
 
+    private static func currentDockProcessId() -> pid_t? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").last?.processIdentifier
+    }
+
+    private static func resetDockObservers() {
+        print("Dock restarted, reconnecting")
+        [appCreateObserver, appDestroyObserver].forEach { observer in
+            if let observer = observer {
+                CFRunLoopRemoveSource(RunLoop.current.getCFRunLoop(), AXObserverGetRunLoopSource(observer), CFRunLoopMode.defaultMode)
+            }
+        }
+        appCreateObserver = nil
+        appDestroyObserver = nil
+        observedDockProcessId = nil
+        observedAppInfos.keys.forEach { appName in
+            observedAppInfos[appName]?.updateAppElement(nil)
+        }
+    }
+
     private static func tryGetTargetAppElement(appName: String) -> AXUIElement? {
-        guard let dockProcessId = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").last?.processIdentifier else {
+        guard let dockProcessId = currentDockProcessId() else {
             return nil
         }
 
@@ -122,9 +154,10 @@ public struct MonitorService {
     }
 
     private static func setupAxObserversOnDock() {
-        guard let dockProcessId = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").last?.processIdentifier else {
+        guard let dockProcessId = currentDockProcessId() else {
             return
         }
+        observedDockProcessId = dockProcessId
 
         AXObserverCreateWithInfoCallback(dockProcessId, { (observer, element, notification, userData, refCon) in
             if let refCon = refCon {
